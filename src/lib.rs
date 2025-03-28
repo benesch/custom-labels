@@ -247,7 +247,8 @@ pub mod asynchronous {
 
             // Add the requested labels to the label set.
             for (k, v) in i {
-                let errno = unsafe { sys::set(k.as_ref().into(), v.as_ref().into()) };
+                let errno =
+                    unsafe { sys::labelset_set(label_set, k.as_ref().into(), v.as_ref().into()) };
                 if errno != 0 {
                     panic!("corruption in custom labels library: errno {errno}")
                 }
