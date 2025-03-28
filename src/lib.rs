@@ -66,6 +66,7 @@ pub mod sys {
     }
 
     pub use c::custom_labels_label_t as Label;
+    pub use c::custom_labels_labelset_t as LabelSet;
     pub use c::custom_labels_string_t as String;
 
     impl<'a> From<&'a [u8]> for self::String {
@@ -199,38 +200,181 @@ where
 }
 
 pub mod asynchronous {
-    use pin_project::pin_project;
+    use pin_project::{pin_project, pinned_drop};
     use std::future::Future;
+    use std::iter;
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
-    pub fn with_label<K, V, Fut, Ret>(k: K, v: V, f: Fut) -> impl Future<Output = Ret>
+    use crate::sys;
+
+    /// A set of custom labels.
+    #[derive(Clone, Copy)]
+    pub struct LabelSet(*mut sys::LabelSet);
+
+    impl LabelSet {
+        /// Constructs a new label set by starting with the current label set
+        /// and adding the indicated key–value pairs.
+        pub fn extend_current<I, K, V>(i: I) -> Self
+        where
+            I: IntoIterator<Item = (K, V)>,
+            K: AsRef<[u8]>,
+            V: AsRef<[u8]>,
+        {
+            // We construct the label set for the future upon construction. This
+            // way we only allocate once, when the future is created, and
+            // not on every call to `poll`.
+
+            let i = i.into_iter();
+            let (i_min, i_max) = i.size_hint();
+            let capacity_hint = i_max.unwrap_or(i_min);
+
+            // Clone the current label set.
+            let label_set = unsafe {
+                let current_label_set = sys::labelset_current();
+                if current_label_set.is_null() {
+                    sys::labelset_new(capacity_hint)
+                } else {
+                    // XXX: seems like labelset_clone should take *const.
+                    // The documentation comment says it's safe to pass the current
+                    // label set though.
+                    sys::labelset_clone(current_label_set as *mut _)
+                }
+            };
+            if label_set.is_null() {
+                panic!("unable to allocate custom label set");
+            }
+
+            // Add the requested labels to the label set.
+            for (k, v) in i {
+                let errno = unsafe { sys::set(k.as_ref().into(), v.as_ref().into()) };
+                if errno != 0 {
+                    panic!("corruption in custom labels library: errno {errno}")
+                }
+            }
+
+            LabelSet(label_set)
+        }
+    }
+
+    unsafe impl Send for LabelSet {}
+
+    /// A [`Future`] with custom labels attached.
+    ///
+    /// This type is returned by the [`Label`] extension trait. See that
+    /// trait's documentation for details.
+    #[pin_project(PinnedDrop)]
+    pub struct Labeled<Fut> {
+        #[pin]
+        inner: Fut,
+        label_set: LabelSet,
+    }
+
+    impl<Fut, Ret> Future for Labeled<Fut>
     where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
         Fut: Future<Output = Ret>,
     {
-        #[pin_project]
-        struct WithLabel<Fut, K, V> {
-            #[pin]
-            inner: Fut,
-            k: K,
-            v: V,
+        type Output = Ret;
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            struct Guard {
+                old_label_set: LabelSet,
+            }
+
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    unsafe { sys::labelset_replace(self.old_label_set.0) };
+                }
+            }
+
+            // Install the future's label set.
+            let old_label_set = unsafe { sys::labelset_replace(self.label_set.0) };
+
+            // Construct a guard that restores the old label set when dropped.
+            // This ensures we restore the old label set even if `poll` panics.
+            let _guard = Guard {
+                old_label_set: LabelSet(old_label_set),
+            };
+
+            // Poll the inner future.
+            self.project().inner.poll(cx)
         }
-        impl<Fut, K, V, Ret> Future for WithLabel<Fut, K, V>
+    }
+
+    #[pinned_drop]
+    impl<Fut> PinnedDrop for Labeled<Fut> {
+        fn drop(self: Pin<&mut Self>) {
+            unsafe { sys::labelset_free(self.label_set.0) };
+        }
+    }
+
+    /// Attaches custom labels to a [`Future`].
+    pub trait Label: Sized {
+        /// Attach the currently active labels to the future.
+        ///
+        /// This can be used to propagate the current labels when spawning
+        /// a new future.
+        fn with_current_labels(self) -> Labeled<Self>;
+
+        /// Attach a single label to the future.
+        ///
+        /// This is equivalent to calling [`with_labels`] with an iterator that
+        /// yields a single key–value pair.
+        fn with_label<K, V, Ret>(self, k: K, v: V) -> Labeled<Self>
+        where
+            K: AsRef<[u8]>,
+            V: AsRef<[u8]>;
+
+        /// Attaches the specified labels to the future.
+        ///
+        /// The labels will be installed in the current thread whenever the
+        /// future is polled, and removed when the poll completes.
+        ///
+        /// This is equivalent to calling [`with_label_set`] with a label
+        /// set constructed via [`LabelSet::extend_current(i)`].
+        fn with_labels<I, K, V>(self, i: I) -> Labeled<Self>
+        where
+            I: IntoIterator<Item = (K, V)>,
+            K: AsRef<[u8]>,
+            V: AsRef<[u8]>;
+
+        /// Attaches the specified label set to the future.
+        ///
+        /// The labels in the set will be installed in the current thread
+        /// whenever the future is polled, and removed when the poll completes.
+        fn with_label_set(self, label_set: LabelSet) -> Labeled<Self>;
+    }
+
+    impl<Fut: Future> Label for Fut {
+        fn with_current_labels(self) -> Labeled<Self> {
+            self.with_labels(iter::empty::<(&[u8], &[u8])>())
+        }
+
+        fn with_label<K, V, Ret>(self, k: K, v: V) -> Labeled<Self>
         where
             K: AsRef<[u8]>,
             V: AsRef<[u8]>,
-            Fut: Future<Output = Ret>,
         {
-            type Output = Ret;
+            self.with_labels(iter::once((k, v)))
+        }
 
-            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                let p = self.project();
-                super::with_label(p.k, p.v, || p.inner.poll(cx))
+        fn with_labels<I, K, V>(self, i: I) -> Labeled<Self>
+        where
+            I: IntoIterator<Item = (K, V)>,
+            K: AsRef<[u8]>,
+            V: AsRef<[u8]>,
+        {
+            Labeled {
+                inner: self,
+                label_set: LabelSet::extend_current(i),
             }
         }
 
-        WithLabel { inner: f, k, v }
+        fn with_label_set(self, label_set: LabelSet) -> Labeled<Self> {
+            Labeled {
+                inner: self,
+                label_set,
+            }
+        }
     }
 }
