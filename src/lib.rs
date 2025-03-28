@@ -285,11 +285,25 @@ pub mod asynchronous {
             impl Drop for Guard {
                 fn drop(&mut self) {
                     unsafe { sys::labelset_replace(self.old_label_set.0) };
+                    println!("current label set: {:?}", unsafe {
+                        sys::labelset_current()
+                    });
                 }
             }
 
             // Install the future's label set.
             let old_label_set = unsafe { sys::labelset_replace(self.label_set.0) };
+            println!("current label set: {:?}", unsafe {
+                sys::labelset_current()
+            });
+            let res = unsafe { sys::get("resource".as_bytes().into()) };
+            let res_str = unsafe {
+                String::from_utf8_lossy(std::slice::from_raw_parts(
+                    (*res).value.buf,
+                    (*res).value.len,
+                ))
+            };
+            println!("resource: {:?}", res_str);
 
             // Construct a guard that restores the old label set when dropped.
             // This ensures we restore the old label set even if `poll` panics.
