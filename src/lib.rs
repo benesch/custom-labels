@@ -209,7 +209,6 @@ pub mod asynchronous {
     use crate::sys;
 
     /// A set of custom labels.
-    #[derive(Clone, Copy)]
     pub struct LabelSet(*mut sys::LabelSet);
 
     impl LabelSet {
